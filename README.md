@@ -1,0 +1,2 @@
+# goreuse
+reuse go
