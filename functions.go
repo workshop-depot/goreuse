@@ -41,16 +41,16 @@ func (sy syncops) syncFile(
 		return errors.WithMessage(err, "error with source file")
 	}
 	// 3
+	_, err = source().newSourceFile(src) //originFile
+	if err != nil {
+		return err
+	}
 	var oldDstFile *sourceFile
 	if err := fs().fileExists(dst); err == nil {
 		oldDstFile, err = source().newSourceFile(dst)
 		if err != nil {
-			return err
+			oldDstFile = nil
 		}
-	}
-	_, err = source().newSourceFile(src) //originFile
-	if err != nil {
-		return err
 	}
 	// 4 copy
 	if err := fs().cp(src, dst, true); err != nil {
@@ -58,23 +58,23 @@ func (sy syncops) syncFile(
 	}
 	// 5 adopt package
 	if err := sy.adoptPackageName(dst, oldDstFile); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	// 6 apply renames and excludes
 	newDstFile, err := source().newSourceFile(dst)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	// filter based on names
 	filtered := sy.pickSymbols(newDstFile, renames)
 	if err := sy.analyse(dst, newDstFile, filtered); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	sy.parsePos(filtered)
 	// replace names
 	allOffsets, replaceWord, err := sy.offsets(filtered)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	lastPos := 0
 	ndst := &bytes.Buffer{}
@@ -90,13 +90,16 @@ func (sy syncops) syncFile(
 	if lastPos > 0 {
 		ndst.Write(content[lastPos:])
 	}
+	if len(ndst.Bytes()) == 0 {
+		ndst.Write(content)
+	}
 	if err := fs().writeFile(dst, ndst.Bytes()); err != nil {
 		return err
 	}
 	// replace old values (if any marked)
 	newDstFile, err = source().newSourceFile(dst)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	filtered = sy.pickSymbols(newDstFile, renames, true)
 	oldFiltered := sy.pickSymbols(oldDstFile, renames, true)
@@ -164,8 +167,10 @@ func (sy syncops) syncFile(
 	if lastPos > 0 {
 		ndst.Write(content[lastPos:])
 	}
-	if err := fs().writeFile(dst, ndst.Bytes()); err != nil {
-		return err
+	if len(ndst.Bytes()) > 0 {
+		if err := fs().writeFile(dst, ndst.Bytes()); err != nil {
+			return err
+		}
 	}
 
 	if time.Now().Hour() > 23 {
