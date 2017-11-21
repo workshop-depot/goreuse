@@ -376,11 +376,13 @@ func (syncops) pickSymbols(sf *sourceFile, renames []rename, pickNew ...bool) ma
 							}
 						}
 					default:
-						logwrn.Printf("UNKNOWS SPEC: %T", xspec)
+						// TODO:
+						// logwrn.Printf("UNKNOWS SPEC: %T", xspec)
 					}
 				}
 			default:
-				logwrn.Printf("UNKNOWS DECL: %T", x)
+				// TODO:
+				// logwrn.Printf("UNKNOWS DECL: %T", x)
 			}
 		}
 	}
