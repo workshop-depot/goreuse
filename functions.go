@@ -340,6 +340,9 @@ func (syncops) analyse(fp string, sf *sourceFile, filtered map[string]*pickedNod
 
 func (syncops) pickSymbols(sf *sourceFile, renames []rename, pickNew ...bool) map[string]*pickedNode {
 	filtered := make(map[string]*pickedNode)
+	if sf == nil || sf.ast == nil {
+		return nil
+	}
 	for _, vdecl := range sf.ast.Decls {
 		for _, vname := range renames {
 			pickedName := vname.oldName
