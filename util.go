@@ -22,7 +22,7 @@ var (
 
 func init() {
 	var flag int
-	flag = stdlog.Lshortfile
+	// flag = stdlog.Lshortfile
 
 	logerr = stdlog.New(os.Stderr, "level=err ", flag)
 	loginf = stdlog.New(os.Stdout, "level=inf ", flag)
