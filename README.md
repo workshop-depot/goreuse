@@ -17,10 +17,10 @@ $ go get -u -v github.com/dc0d/goreuse
 
 # sample usage (TODO)
 
-This command syncs these two files, then customizes the type names and if the types are already redefined, it would preserve the new definition.
+This command syncs these two files, then customizes the type names (or other identifiers) and if the types are already redefined, it would preserve the new definition.
 
 ```
-$ goreuse file --src ./code-templates/generic-map.go --dst ./name-count-map.go -t nameKey=tkey -t countVal=tval -t nameCount=safemap
+$ goreuse file --src ./code-templates/generic-map.go --dst ./name-count-map.go -r nameKey=tkey -r countVal=tval -r nameCount=safemap
 ```
 
 # tests (TODO)

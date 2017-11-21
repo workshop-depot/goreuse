@@ -9,13 +9,22 @@ import (
 
 // flags
 var (
-	fileSource      string
-	fileDestination string
-	typeRename      = cli.StringSlice([]string{})
+	θfileOrigin      string
+	θfileDestination string
+	θsymbolRename    = cli.StringSlice([]string{})
 )
 
 var (
-	logerr = stdlog.New(os.Stderr, "level=err ", 0)
-	loginf = stdlog.New(os.Stdout, "level=inf ", 0)
-	logwrn = stdlog.New(os.Stdout, "level=wrn ", 0)
+	logerr *stdlog.Logger
+	loginf *stdlog.Logger
+	logwrn *stdlog.Logger
 )
+
+func init() {
+	var flag int
+	flag = stdlog.Lshortfile
+
+	logerr = stdlog.New(os.Stderr, "level=err ", flag)
+	loginf = stdlog.New(os.Stdout, "level=inf ", flag)
+	logwrn = stdlog.New(os.Stdout, "level=wrn ", flag)
+}

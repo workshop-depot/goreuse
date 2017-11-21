@@ -33,21 +33,22 @@ func addCommands(app *cli.App) {
 	}
 	cmdfile.Flags = []cli.Flag{
 		cli.StringFlag{
-			Name:        "src",
-			Usage:       "path to source file",
-			Destination: &fileSource,
+			Name:        "origin",
+			Usage:       "path to origin file",
+			Destination: &θfileOrigin,
 		},
 		cli.StringFlag{
 			Name:        "dst",
 			Usage:       "path to destination file",
-			Destination: &fileDestination,
+			Destination: &θfileDestination,
 		},
 		cli.StringSliceFlag{
-			Name:  "type-rename,t",
-			Usage: "-t NEW_TYPE=OLD_TYPE -t NEW_TYPE_2=OLD_TYPE_2",
-			Value: &typeRename,
-		},
-	}
+			Name: "rename,r",
+			Usage: `-r newName+=oldName -r newName2=oldName2
+	the += means preserve definition
+	names must be valid Go identifiers"`,
+			Value: &θsymbolRename,
+		}}
 
 	app.Commands = append(app.Commands, cmdsrv, cmdfile)
 }

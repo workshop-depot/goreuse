@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -15,330 +16,485 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/tools/cmd/guru/serial"
 )
 
 //-----------------------------------------------------------------------------
+// sync ops
 
-func syncFile(src, dst string, typeRename ...string) error {
-	typePairs, err := validateFormat(typeRename...)
+func (sy syncops) syncFile(
+	src, dst string,
+	symbolRename []string) error {
+	// 1
+	renames, err := param().parsePairs(symbolRename...)
 	if err != nil {
 		return err
 	}
-
+	// 2
 	src, _ = filepath.Abs(src)
 	dst, _ = filepath.Abs(dst)
-	if err := fileExists(src); err != nil {
-		return errors.WithMessage(err, "source file")
+	if err := fs().fileExists(src); err != nil {
+		return errors.WithMessage(err, "error with source file")
 	}
-
-	// filter based on typeRename
-	var original map[string]string
-	if err := fileExists(dst); err == nil {
-		buffer, err := originalTypedefs(dst)
+	// 3
+	var oldDstFile *sourceFile
+	if err := fs().fileExists(dst); err == nil {
+		oldDstFile, err = source().newSourceFile(dst)
 		if err != nil {
-			logerr.Println(err)
+			return err
 		}
-		nameset := make(map[string]struct{})
-		for _, v := range typeRename {
-			nameset[v] = struct{}{}
-		}
-		original = make(map[string]string)
-		for k, v := range buffer {
-			if _, ok := nameset[k]; ok {
+	}
+	_, err = source().newSourceFile(src) //originFile
+	if err != nil {
+		return err
+	}
+	// 4 copy
+	if err := fs().cp(src, dst, true); err != nil {
+		return err
+	}
+	// 5 adopt package
+	if err := sy.adoptPackageName(dst, oldDstFile); err != nil {
+		return err
+	}
+	// 6 apply renames and excludes
+	newDstFile, err := source().newSourceFile(dst)
+	if err != nil {
+		return err
+	}
+	// filter based on names
+	filtered := sy.pickSymbols(newDstFile, renames)
+	if err := sy.analyse(dst, newDstFile, filtered); err != nil {
+		return err
+	}
+	sy.parsePos(filtered)
+	// replace names
+	allOffsets, replaceWord, err := sy.offsets(filtered)
+	if err != nil {
+		return err
+	}
+	lastPos := 0
+	ndst := &bytes.Buffer{}
+	content, err := ioutil.ReadFile(dst)
+	if err != nil {
+		return err
+	}
+	for _, voff := range allOffsets {
+		ndst.Write(content[lastPos:voff[0]])
+		ndst.Write(replaceWord[voff])
+		lastPos = voff[1]
+	}
+	if lastPos > 0 {
+		ndst.Write(content[lastPos:])
+	}
+	if err := fs().writeFile(dst, ndst.Bytes()); err != nil {
+		return err
+	}
+	// replace old values (if any marked)
+	newDstFile, err = source().newSourceFile(dst)
+	if err != nil {
+		return err
+	}
+	filtered = sy.pickSymbols(newDstFile, renames, true)
+	oldFiltered := sy.pickSymbols(oldDstFile, renames, true)
+	type defReplace struct {
+		newStart, newEnd int
+		oldDef           []byte
+	}
+	var listReplace []defReplace
+	for _, vnew := range filtered {
+		for _, vold := range oldFiltered {
+			if !vold.rename.preserve {
 				continue
 			}
-			nameset[k] = struct{}{}
-			original[k] = v
-		}
-		if len(original) == 0 {
-			original = nil
+			if vnew.rename != vold.rename {
+				continue
+			}
+
+			switch {
+			case vold.funcDecl != nil:
+				start, end := oldDstFile.offsets(vold.funcDecl)
+				oldDef := oldDstFile.content[start:end]
+				newStart, newEnd := newDstFile.offsets(vnew.funcDecl)
+				listReplace = append(listReplace, defReplace{
+					newStart: newStart,
+					newEnd:   newEnd,
+					oldDef:   oldDef,
+				})
+			case vold.typeSpec != nil:
+				start, end := oldDstFile.offsets(vold.typeSpec)
+				oldDef := oldDstFile.content[start:end]
+				newStart, newEnd := newDstFile.offsets(vnew.typeSpec)
+				listReplace = append(listReplace, defReplace{
+					newStart: newStart,
+					newEnd:   newEnd,
+					oldDef:   oldDef,
+				})
+			case vold.valueSpec != nil:
+				start, end := oldDstFile.offsets(vold.valueSpec)
+				oldDef := oldDstFile.content[start:end]
+				newStart, newEnd := newDstFile.offsets(vnew.valueSpec)
+				listReplace = append(listReplace, defReplace{
+					newStart: newStart,
+					newEnd:   newEnd,
+					oldDef:   oldDef,
+				})
+			}
 		}
 	}
-
-	if err := adoptPackage(src, dst); err != nil {
+	var replaceOffsets [][2]int
+	replaceDefs := make(map[[2]int][]byte)
+	for _, vr := range listReplace {
+		current := [2]int{vr.newStart, vr.newEnd}
+		replaceOffsets = append(replaceOffsets, current)
+		replaceDefs[current] = vr.oldDef
+	}
+	sort.Sort(offsets(replaceOffsets))
+	content = newDstFile.content
+	lastPos = 0
+	ndst = &bytes.Buffer{}
+	for _, voff := range replaceOffsets {
+		ndst.Write(content[lastPos:voff[0]])
+		ndst.Write(replaceDefs[voff])
+		lastPos = voff[1]
+	}
+	if lastPos > 0 {
+		ndst.Write(content[lastPos:])
+	}
+	if err := fs().writeFile(dst, ndst.Bytes()); err != nil {
 		return err
 	}
 
-	renameTypes(dst, typePairs)
-
-	// redefine types
-	if original != nil {
-		fileset, typeset, err := findTypes(dst)
-		if err != nil {
-			return err
-		}
-
-		var list []typeEntry
-		for _, vt := range typeset {
-			start := int(fileset.Position(vt.Pos()).Offset)
-			end := int(fileset.Position(vt.End()).Offset)
-			list = append(list, typeEntry{
-				startOffset: start,
-				endOffset:   end,
-				spec:        vt,
-			})
-		}
-
-		sort.Sort(entries(list))
-
-		lastPos := 0
-		content, err := ioutil.ReadFile(dst)
-		if err != nil {
-			return err
-		}
-		to := &bytes.Buffer{}
-		for _, ve := range list {
-			oldDef, ok := original[ve.spec.Name.Name]
-			if !ok || len(oldDef) == 0 {
-				continue
-			}
-			to.Write(content[lastPos:ve.startOffset])
-			to.Write([]byte(oldDef))
-			lastPos = ve.endOffset
-		}
-		if lastPos > 0 {
-			to.Write(content[lastPos:])
-		}
-		if err := writeFile(dst, string(to.Bytes())); err != nil {
-			return err
-		}
+	if time.Now().Hour() > 23 {
+		// ...
 	}
 
 	return nil
 }
 
-type typeEntry struct {
-	startOffset, endOffset int
-	spec                   *ast.TypeSpec
-}
-
-type entries []typeEntry
-
-func (e entries) Len() int           { return len(e) }
-func (e entries) Swap(i, j int)      { e[i], e[j] = e[j], e[i] }
-func (e entries) Less(i, j int) bool { return e[i].startOffset < e[j].startOffset }
-
-func originalTypedefs(fp string) (map[string]string, error) {
-	originalFileset, originalTypeset, err := findTypes(fp)
-	if err != nil {
-		return nil, err
+func (sy syncops) offsets(filtered map[string]*pickedNode) ([][2]int, map[[2]int][]byte, error) {
+	files := make(map[string][]byte)
+	getContent := func(fp string) ([]byte, error) {
+		content, ok := files[fp]
+		if ok {
+			return content, nil
+		}
+		content, err := ioutil.ReadFile(fp)
+		if err != nil {
+			return nil, err
+		}
+		files[fp] = content
+		return content, nil
 	}
-	content, err := ioutil.ReadFile(fp)
-	if err != nil {
-		return nil, err
-	}
-	result := make(map[string]string)
-	for _, vt := range originalTypeset {
-		start := int(originalFileset.Position(vt.Pos()).Offset)
-		end := int(originalFileset.Position(vt.End()).Offset)
-		result[vt.Name.Name] = fmt.Sprintf("%s", content[start:end])
-	}
-	return result, nil
-}
-
-func renameTypes(dst string, typePairs [][2]string) error {
-	fileset, typeset, err := findTypes(dst)
-	if err != nil {
-		return err
-	}
-	_, _ = fileset, typeset
-
-	var positions []pos
-	for _, pair := range typePairs {
-		for _, vt := range typeset {
-			if vt.Name.Name != pair[1] {
-				continue
+	for _, vp := range filtered {
+		for _, va := range vp.analyzed {
+			if va.initialPosition != nil {
+				content, err := getContent(va.initialPosition.filePath)
+				if err != nil {
+					return nil, nil, err
+				}
+				startOffset, endOffset := sy.fileOffset(
+					content, []byte(vp.rename.oldName),
+					va.initialPosition.line,
+					va.initialPosition.pos)
+				va.allOffsets = append(va.allOffsets, [2]int{startOffset, endOffset})
 			}
-			start := int(fileset.Position(vt.Name.Pos()).Offset)
-			outset, errset, err := guru(dst, importPath(dst), start)
-			if err != nil {
-				return err
+			for _, vpos := range va.refPositions {
+				content, err := getContent(vpos.filePath)
+				if err != nil {
+					return nil, nil, err
+				}
+				startOffset, endOffset := sy.fileOffset(
+					content, []byte(vp.rename.oldName),
+					vpos.line,
+					vpos.pos)
+				va.allOffsets = append(va.allOffsets, [2]int{startOffset, endOffset})
 			}
-			if len(errset) > 0 {
-				logerr.Printf("%s", errset)
-				continue
-			}
-
-			spanset := extractPositions(outset)
-			spanset = filterSpans(dst, spanset)
-			positions = append(positions, pos{spanset, pair})
 		}
 	}
-	replace(dst, positions)
-	return nil
-}
-
-type pos struct {
-	spans []span
-	names [2]string
-}
-
-func replace(fp string, positions []pos) {
-	content, err := ioutil.ReadFile(fp)
-	if err != nil {
-		logerr.Println(err)
-		return
+	var allOffsets [][2]int
+	replaceWord := make(map[[2]int][]byte)
+	for _, vp := range filtered {
+		for _, va := range vp.analyzed {
+			for _, voff := range va.allOffsets {
+				allOffsets = append(allOffsets, voff)
+				replaceWord[voff] = []byte(vp.rename.newName)
+			}
+		}
 	}
-	from := bytes.NewBuffer(content)
-	var lineset [][]byte
-	for err == nil {
-		var line []byte
-		line, err = from.ReadBytes('\n')
+	sort.Sort(offsets(allOffsets))
+	return allOffsets, replaceWord, nil
+}
+
+type offsets [][2]int
+
+func (e offsets) Len() int           { return len(e) }
+func (e offsets) Swap(i, j int)      { e[i], e[j] = e[j], e[i] }
+func (e offsets) Less(i, j int) bool { return e[i][0] < e[j][0] }
+
+func (syncops) fileOffset(content, word []byte, line, linePos int) (start, end int) {
+	buf := bytes.NewBuffer(content)
+	offset := 0
+	for i := 1; i < line; i++ {
+		line, err := buf.ReadBytes('\n')
 		if err != nil {
 			break
 		}
-		lineset = append(lineset, line)
+		offset += len(line)
 	}
-	to := &bytes.Buffer{}
-	for kline, vline := range lineset {
-		written := false
+	offset += linePos
+	offset--
+	return offset, offset + len(word)
+}
 
-		var lineSpans []span
-		names := make(map[span][2]string)
-		for _, vp := range positions {
-			for _, vs := range vp.spans {
-				// code assumes startline and the end line are the same
-				if vs.startline != vs.endline {
-					logerr.Printf("broken assumption %v", vs)
-					continue
-				}
-				if vs.startline != kline+1 {
-					continue
-				}
-				lineSpans = append(lineSpans, vs)
-				names[vs] = vp.names
+func (syncops) parsePos(filtered map[string]*pickedNode) {
+	for _, v := range filtered {
+		for _, va := range v.analyzed {
+			if va.initial != nil {
+				var pos parsedPos
+				pos.filePath, pos.line, pos.pos = guru().parsePos(va.initial.ObjPos)
+				va.initialPosition = &pos
 			}
-		}
-
-		sort.Sort(sortedSpans(lineSpans))
-		lastPos := 0
-		for _, vs := range lineSpans {
-			to.Write(vline[lastPos : vs.startpos-1])
-			to.Write([]byte(names[vs][0]))
-			lastPos = vs.endpos
-			written = true
-		}
-		if lastPos > 0 {
-			to.Write(vline[lastPos:])
-		}
-
-		if written {
-			continue
-		}
-		to.Write(vline)
-	}
-	if err := writeFile(fp, string(to.Bytes())); err != nil {
-		logerr.Println(err)
-	}
-}
-
-type sortedSpans []span
-
-func (ss sortedSpans) Len() int           { return len(ss) }
-func (ss sortedSpans) Swap(i, j int)      { ss[i], ss[j] = ss[j], ss[i] }
-func (ss sortedSpans) Less(i, j int) bool { return ss[i].startpos < ss[j].startpos }
-
-func filterSpans(fp string, spans []span) []span {
-	var result []span
-	for _, vs := range spans {
-		if vs.filepath != fp {
-			continue
-		}
-		result = append(result, vs)
-	}
-	return result
-}
-
-func extractPositions(outset []byte) []span {
-	var (
-		rg     = regexp.MustCompile("(?P<filepath>[^:]+):(?P<startline>\\d+)\\.(?P<startpos>\\d+)-(?P<endline>\\d+)\\.(?P<endpos>\\d+):")
-		nl     = rg.SubexpNames()
-		buf    = bytes.NewBuffer(outset)
-		line   string
-		err    error
-		result []span
-	)
-	for line, err = "", error(nil); err == nil; line, err = buf.ReadString('\n') {
-		if line == "" {
-			continue
-		}
-		matchset := rg.FindAllStringSubmatch(line, -1)
-		if len(matchset) == 0 {
-			continue
-		}
-		parts := make(map[string]string)
-		for k, v := range matchset[0] {
-			if k == 0 {
+			if va.refs == nil {
 				continue
 			}
-			parts[nl[k]] = v
+			if len(va.refs.Refs) == 0 {
+				continue
+			}
+			va.refPositions = make([]parsedPos, len(va.refs.Refs))
+			for kr, vr := range va.refs.Refs {
+				var pos parsedPos
+				pos.filePath, pos.line, pos.pos = guru().parsePos(vr.Pos)
+				va.refPositions[kr] = pos
+			}
 		}
-		startline, err := strconv.Atoi(parts["startline"])
-		if err != nil {
-			logerr.Println(err)
-			continue
-		}
-		startpos, err := strconv.Atoi(parts["startpos"])
-		if err != nil {
-			logerr.Println(err)
-			continue
-		}
-		endline, err := strconv.Atoi(parts["endline"])
-		if err != nil {
-			logerr.Println(err)
-			continue
-		}
-		endpos, err := strconv.Atoi(parts["endpos"])
-		if err != nil {
-			logerr.Println(err)
-			continue
-		}
-		fpath := parts["filepath"]
+	}
 
-		result = append(result, span{
-			startline: startline,
-			startpos:  startpos,
-			endline:   endline,
-			endpos:    endpos,
-			filepath:  fpath,
-		})
-	}
-	if err != nil && err != io.EOF {
-		logerr.Println(err)
-	}
-	return result
 }
 
-type span struct {
-	startline, startpos, endline, endpos int
-	filepath                             string
+func (syncops) analyse(fp string, sf *sourceFile, filtered map[string]*pickedNode) error {
+	for _, picked := range filtered {
+		switch {
+		case picked.funcDecl != nil:
+			start, end := sf.offsets(picked.funcDecl.Name)
+			initial, refs, serr, err := guru().referrers(fp, start, "")
+			if err != nil {
+				return err
+			}
+			if len(serr) > 0 {
+				return errors.New(string(serr))
+			}
+			az := analyzed{
+				initial: initial,
+				refs:    refs,
+				start:   start,
+				end:     end,
+			}
+			picked.analyzed = append(picked.analyzed, &az)
+		case picked.typeSpec != nil:
+			start, end := sf.offsets(picked.typeSpec.Name)
+			initial, refs, serr, err := guru().referrers(fp, start, "")
+			if err != nil {
+				return err
+			}
+			if len(serr) > 0 {
+				return errors.New(string(serr))
+			}
+			az := analyzed{
+				initial: initial,
+				refs:    refs,
+				start:   start,
+				end:     end,
+			}
+			picked.analyzed = append(picked.analyzed, &az)
+		case picked.valueSpec != nil:
+			for _, vname := range picked.valueSpec.Names {
+				start, end := sf.offsets(vname)
+				initial, refs, serr, err := guru().referrers(fp, start, "")
+				if err != nil {
+					return err
+				}
+				if len(serr) > 0 {
+					return errors.New(string(serr))
+				}
+				az := analyzed{
+					initial: initial,
+					refs:    refs,
+					start:   start,
+					end:     end,
+				}
+				picked.analyzed = append(picked.analyzed, &az)
+			}
+		}
+	}
+	return nil
 }
 
-func adoptPackage(src, dst string) error {
-	pkg, _, _, err := getPackage(dst)
+func (syncops) pickSymbols(sf *sourceFile, renames []rename, pickNew ...bool) map[string]*pickedNode {
+	filtered := make(map[string]*pickedNode)
+	for _, vdecl := range sf.ast.Decls {
+		for _, vname := range renames {
+			pickedName := vname.oldName
+			if len(pickNew) > 0 && pickNew[0] {
+				pickedName = vname.newName
+			}
+			switch x := vdecl.(type) {
+			case *ast.FuncDecl:
+				if x.Name.Name == pickedName {
+					filtered[pickedName] = &pickedNode{
+						rename:   vname,
+						funcDecl: x,
+					}
+				}
+			case *ast.GenDecl:
+				for _, vspec := range x.Specs {
+					switch xspec := vspec.(type) {
+					case *ast.TypeSpec:
+						if xspec.Name.Name == pickedName {
+							filtered[pickedName] = &pickedNode{
+								rename:   vname,
+								typeSpec: xspec,
+							}
+						}
+					case *ast.ValueSpec:
+						for kval, vval := range xspec.Names {
+							if vval.Name == pickedName {
+								v := pickedNode{
+									rename: vname,
+								}
+								v.valueSpec = xspec
+								v.valueIndex = kval
+								filtered[pickedName] = &v
+							}
+						}
+					default:
+						logwrn.Printf("UNKNOWS SPEC: %T", xspec)
+					}
+				}
+			default:
+				logwrn.Printf("UNKNOWS DECL: %T", x)
+			}
+		}
+	}
+	return filtered
+}
+
+type pickedNode struct {
+	rename     rename
+	funcDecl   *ast.FuncDecl
+	typeSpec   *ast.TypeSpec
+	valueSpec  *ast.ValueSpec
+	valueIndex int
+
+	analyzed []*analyzed
+}
+
+type analyzed struct {
+	initial         *serial.ReferrersInitial
+	refs            *serial.ReferrersPackage
+	start           int
+	end             int
+	initialPosition *parsedPos
+	refPositions    []parsedPos
+	allOffsets      [][2]int
+}
+
+type parsedPos struct {
+	filePath  string
+	line, pos int
+}
+
+func (syncops) adoptPackageName(dst string, oldDstFile *sourceFile) error {
+	newDstFile, err := source().newSourceFile(dst)
 	if err != nil {
 		return err
 	}
-	if err := cp(src, dst, true); err != nil {
-		return err
+	var packageName []byte
+	if oldDstFile != nil {
+		packageName = oldDstFile.packageName()
+	} else {
+		packageName = []byte(filepath.Base(fs().importPath(dst)))
 	}
-	_, pos, end, err := getPackage(dst)
-	if err != nil {
-		return err
-	}
-	content, err := ioutil.ReadFile(dst)
-	if strings.HasPrefix(pkg, "package") {
-		pkg = strings.TrimPrefix(pkg, "package")
-	}
-	pkg = strings.TrimSpace(pkg)
-	return writeFile(
-		dst,
-		fmt.Sprintf("%s%s%s", content[:pos], "package "+pkg, content[end:]))
+	return fs().writeFile(dst, newDstFile.renamePackage(packageName))
 }
 
-func findTypes(fp string) (*token.FileSet, []*ast.TypeSpec, error) {
+func dsync() syncops { return syncops{} }
+
+type syncops struct{}
+
+//-----------------------------------------------------------------------------
+// go source
+
+type ender interface {
+	End() token.Pos
+}
+
+type poser interface {
+	Pos() token.Pos
+}
+
+type endposer interface {
+	poser
+	ender
+}
+
+// sourceFile
+
+func (sf *sourceFile) renamePackage(newName []byte) (newContent []byte) {
+	start, end := sf.offsets(sf.ast.Name)
+	return bytes.Join([][]byte{sf.content[:start], newName, sf.content[end:]}, nil)
+}
+
+func (sf *sourceFile) packageName() []byte {
+	start, end := sf.offsets(sf.ast.Name)
+	return sf.content[start:end]
+}
+
+func (sf *sourceFile) offsets(v endposer) (start, end int) {
+	return source().offsets(sf.set, v)
+}
+
+func newSourceFile(
+	content []byte,
+	set *token.FileSet,
+	ast *ast.File) *sourceFile {
+	return &sourceFile{
+		content: content,
+		set:     set,
+		ast:     ast,
+	}
+}
+
+type sourceFile struct {
+	content []byte
+	set     *token.FileSet
+	ast     *ast.File
+}
+
+// sourceops
+
+func (sourceops) offsets(set *token.FileSet, v endposer) (start, end int) {
+	start = int(set.Position(v.Pos()).Offset)
+	end = int(set.Position(v.End()).Offset)
+	return
+}
+
+func (so sourceops) newSourceFile(fp string) (*sourceFile, error) {
+	content, err := ioutil.ReadFile(fp)
+	if err != nil {
+		return nil, err
+	}
+	fset, fast, err := so.parse(fp)
+	if err != nil {
+		return nil, err
+	}
+	return newSourceFile(content, fset, fast), nil
+}
+
+func (sourceops) parse(fp string) (*token.FileSet, *ast.File, error) {
 	fset := token.NewFileSet()
 	fast, err := parser.ParseFile(
 		fset,
@@ -346,80 +502,109 @@ func findTypes(fp string) (*token.FileSet, []*ast.TypeSpec, error) {
 		nil,
 		parser.AllErrors)
 	if err != nil {
-		return nil, nil, err
+		fset = nil
+		fast = nil
 	}
-	var res []*ast.TypeSpec
-	for _, vdec := range fast.Decls {
-		x, ok := vdec.(*ast.GenDecl)
-		if !ok {
-			continue
-		}
-		if !x.Tok.IsKeyword() {
-			continue
-		}
-		if x.Tok.String() != "type" {
-			continue
-		}
-		if len(x.Specs) == 0 {
-			continue
-		}
-		spec, ok := x.Specs[0].(*ast.TypeSpec)
-		if !ok {
-			continue
-		}
-		// if spec.Assign == 0 {
-		// 	continue
-		// }
-		res = append(res, spec)
-	}
-
-	return fset, res, nil
+	return fset, fast, err
 }
 
-func importPath(path string) string {
-	src, err := checkSrcDir()
+func source() sourceops { return sourceops{} }
+
+type sourceops struct{}
+
+//-----------------------------------------------------------------------------
+// guru
+
+func (g guruops) referrers(gofile string, start int, importPath ...string) (initial *serial.ReferrersInitial, refs *serial.ReferrersPackage, stderr []byte, err error) {
+	var stdout []byte
+	stdout, stderr, err = g.run(
+		gofile,
+		"referrers",
+		start,
+		importPath...)
+	if err != nil {
+		return
+	}
+	if len(stderr) > 0 {
+		return
+	}
+	if len(stdout) == 0 {
+		err = errNoOutput
+		return
+	}
+
+	buf := bytes.NewBuffer(stdout)
+	var text []byte
+	for line, err := ([]byte)(nil), (error)(nil); err == nil; line, err = buf.ReadBytes('\n') {
+		text = append(text, line...)
+		if len(line) > 0 && line[0] == '}' {
+			break
+		}
+	}
+	if len(text) == 0 {
+		return
+	}
+	var ibuf serial.ReferrersInitial
+	err = json.Unmarshal(text, &ibuf)
+	if err != nil {
+		return
+	}
+	initial = &ibuf
+	text = nil
+	for line, err := ([]byte)(nil), (error)(nil); err == nil; line, err = buf.ReadBytes('\n') {
+		text = append(text, line...)
+		if len(line) > 0 && line[0] == '}' {
+			break
+		}
+	}
+	if len(text) == 0 {
+		return
+	}
+	var rbuf serial.ReferrersPackage
+	err = json.Unmarshal(text, &rbuf)
+	if err != nil {
+		return
+	}
+	refs = &rbuf
+
+	return
+}
+
+var errNoOutput = errorf("NO OUTPUT")
+
+func (guruops) parsePos(posStr string) (filePath string, line, pos int) {
+	parts := strings.Split(posStr, ":")
+	if len(parts) != 3 {
+		return
+	}
+	var err error
+	line, err = strconv.Atoi(parts[1])
 	if err != nil {
 		panic(err)
 	}
-	dir := path
-	if err := dirExists(dir); err != nil {
-		if err == errNotDir {
-			dir = filepath.Dir(dir)
-		} else {
-			panic(err)
-		}
+	pos, err = strconv.Atoi(parts[2])
+	if err != nil {
+		panic(err)
 	}
-	return strings.Trim(strings.Replace(dir, src, "", -1), string([]rune{filepath.Separator}))
+	filePath = parts[0]
+	return
 }
 
-func validateFormat(typeRename ...string) ([][2]string, error) {
-	r := regexp.MustCompile("^(?P<new>\\w+)=(?P<old>\\w+)$")
-	nl := r.SubexpNames()
-	var res [][2]string
-	for _, v := range typeRename {
-		rr := r.FindAllStringSubmatch(v, -1)
-		if len(rr) == 0 {
-			return nil, errorf("invalid type rename: %v", v)
+// no importPath == no scope; empty importPath == get from gofile
+func (guruops) run(gofile, subcmd string, start int, importPath ...string) (bytesstdout, bytesstderr []byte, funcerr error) {
+	var args []string
+	if len(importPath) > 0 {
+		pip := importPath[0]
+		if pip == "" {
+			pip = fs().importPath(gofile)
 		}
-		parts := make(map[string]string)
-		for k, v := range rr[0] {
-			parts[nl[k]] = v
-		}
-		var pair [2]string
-		pair[0] = parts["new"]
-		pair[1] = parts["old"]
-		res = append(res, pair)
+		args = append(args, "-scope", pip)
 	}
-	return res, nil
-}
-
-//-----------------------------------------------------------------------------
-
-func guru(fp, pip string, start int) ([]byte, []byte, error) {
+	args = append(args, "-json")
+	args = append(args, subcmd, fmt.Sprintf("%v:#%v", gofile, start))
 	cmd := exec.Command(
 		"guru",
-		"-scope", pip,
-		"referrers", fmt.Sprintf("%v:#%v", fp, start))
+		args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, nil, err
@@ -446,98 +631,98 @@ func guru(fp, pip string, start int) ([]byte, []byte, error) {
 	return outset.Bytes(), errset.Bytes(), nil
 }
 
+func guru() guruops { return guruops{} }
+
+type guruops struct{}
+
 //-----------------------------------------------------------------------------
-// source code
+// validation
 
-func getPackage(fp string) (string, int, int, error) {
-	pos, end, err := filePkg(fp, true)
-	if err == nil {
-		content, err := ioutil.ReadFile(fp)
-		if err == nil {
-			return fmt.Sprintf("%s", content[pos:end]), pos, end, nil
+// parses pair in format NewL=OldR where L and R are valid Go identifiers
+func (paramops) parsePairs(renames ...string) ([]rename, error) {
+	r := regexp.MustCompile("^(?P<new>\\w+)(?P<preserve>\\+)*=(?P<old>\\w+)$")
+	nl := r.SubexpNames()
+	var res []rename
+	for _, v := range renames {
+		rr := r.FindAllStringSubmatch(v, -1)
+		if len(rr) == 0 {
+			return nil, errorf("invalid pair: %v", v)
 		}
-	}
-	pos, end, err = filePkg(fp)
-	if err == nil {
-		content, err := ioutil.ReadFile(fp)
-		if err == nil {
-			return fmt.Sprintf("%s", content[pos:end]), pos, end, nil
+		parts := make(map[string]string)
+		for k, v := range rr[0] {
+			parts[nl[k]] = v
 		}
+		var rn rename
+		rn.newName = parts["new"]
+		rn.oldName = parts["old"]
+		if parts["preserve"] == "+" {
+			rn.preserve = true
+		}
+		res = append(res, rn)
 	}
-	dir := filepath.Dir(fp)
-	if err := dirExists(dir); err != nil {
-		return "", 0, 0, err
-	}
-	return filepath.Base(dir), 0, 0, nil
+	return res, nil
 }
 
-func filePkg(fp string, exclude ...bool) (int, int, error) {
-	x := false
-	if len(exclude) > 0 {
-		x = exclude[0]
-	}
-
-	if x {
-		dir := filepath.Dir(fp)
-		list, err := ioutil.ReadDir(dir)
-		if err != nil {
-			return 0, 0, err
-		}
-		for _, v := range list {
-			if v.IsDir() {
-				continue
-			}
-			pos, end, err := filePkg(filepath.Join(dir, v.Name()))
-			if err == nil {
-				return pos, end, nil
-			}
-		}
-		return 0, 0, errNoPackage
-	}
-
-	fset := token.NewFileSet()
-	fast, err := parser.ParseFile(fset, fp, nil, parser.PackageClauseOnly)
-	if err != nil {
-		return 0, 0, errors.WithStack(err)
-	}
-
-	pos := int(fset.Position(fast.Pos()).Offset)
-	end := int(fset.Position(fast.End()).Offset)
-
-	return pos, end, nil
+type rename struct {
+	newName, oldName string
+	preserve         bool
 }
 
-var errNoPackage = errorf("NO PKG FOUND")
+type paramops struct{}
+
+func param() paramops { return paramops{} }
 
 //-----------------------------------------------------------------------------
 // file system
 
-func checkSrcDir() (string, error) {
-	gopath := os.Getenv("GOPATH")
-	if err := dirExists(gopath); err != nil {
-		return "", errors.WithMessage(err, fmt.Sprintf("not found, $GOPATH = %v", gopath))
+func (fs fsops) importPath(path string) string {
+	src := fs.gosrc()
+	dir := path
+	if err := fs.dirExists(dir); err != nil {
+		if err == errNotDir {
+			dir = filepath.Dir(dir)
+		} else {
+			panic(err)
+		}
 	}
-
-	parts := strings.Split(gopath, string([]rune{filepath.ListSeparator}))
-	gopath = parts[0]
-
-	src := filepath.Join(gopath, "src")
-	if err := dirExists(src); err != nil {
-		return "", errors.WithMessage(err, "src directory not found")
-	}
-
-	return src, nil
+	return strings.Trim(strings.Replace(dir, src, "", -1), string([]rune{filepath.Separator}))
 }
 
-func mkdir(d string) error {
+func (fs fsops) gosrc() string {
+	var err error
+	θgopathonce.Do(func() {
+		gopath := os.Getenv("GOPATH")
+		if err = fs.dirExists(gopath); err != nil {
+			err = errors.WithMessage(err, fmt.Sprintf("not found, $GOPATH = %v", gopath))
+			return
+		}
+		parts := strings.Split(gopath, string([]rune{filepath.ListSeparator}))
+		gopath = parts[0]
+		θgopath = filepath.Join(gopath, "src")
+		if err = fs.dirExists(θgopath); err != nil {
+			err = errors.WithMessage(err, "src directory not found")
+		}
+	})
+	if err != nil {
+		panic(err)
+	}
+	return θgopath
+}
+
+var (
+	θgopath     string
+	θgopathonce sync.Once
+)
+
+func (fsops) mkdir(d string) error {
 	return os.Mkdir(d, 0777)
 }
 
-func writeFile(path, content string) error {
-	return ioutil.WriteFile(path, []byte(content), 0777)
+func (fsops) writeFile(path string, content []byte) error {
+	return ioutil.WriteFile(path, content, 0777)
 }
 
-func cp(src, dst string, overwrite ...bool) (funcErr error) {
+func (fsops) cp(src, dst string, overwrite ...bool) (funcErr error) {
 	fw := false
 	if len(overwrite) > 0 {
 		fw = overwrite[0]
@@ -574,7 +759,7 @@ func cp(src, dst string, overwrite ...bool) (funcErr error) {
 	return nil
 }
 
-func fileExists(path string) error {
+func (fsops) fileExists(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -585,7 +770,7 @@ func fileExists(path string) error {
 	return nil
 }
 
-func dirExists(path string) error {
+func (fsops) dirExists(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -600,6 +785,10 @@ var (
 	errNotDir  = errorf("NOT A DIR")
 	errNotFile = errorf("NOT A FILE")
 )
+
+type fsops struct{}
+
+func fs() fsops { return fsops{} }
 
 //-----------------------------------------------------------------------------
 
