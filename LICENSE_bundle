@@ -1,0 +1,3 @@
+The code from bundle command (docs at 
+https://godoc.org/golang.org/x/tools/cmd/bundle) has its 
+own license (BSD-style). See its documentation.
