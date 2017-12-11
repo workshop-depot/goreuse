@@ -18,4 +18,4 @@ Or from the master branch:
 $ go get -u -v github.com/dc0d/goreuse
 ```
 
-_More information is provided inside the documentation_.
+_More information is provided inside the documentation_. A video tutorial is available [here](https://www.youtube.com/watch?v=Dw7gSWM0Wb0&feature=youtu.be).
