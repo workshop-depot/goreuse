@@ -14,6 +14,9 @@ To rename some individual identifiers ("-rn" flag can be repeated):
 To rename some individual identifiers and preserve the changes that are made to it's definition (note the "+" sign in "newName+=oldName"):
 	$ goreuse -rn newName+=oldName -o some-file.go -prefix prefx_ the/package/to/bundle
 
+"goreuse" runs "goreturns" on the output file which can be installed by:
+	$ go get -u -v sourcegraph.com/sqs/goreturns
+
 Sample Scenario
 
 Assume we have implemented a template for pipeline pattern (at this step it contains a bug intentially):
@@ -85,6 +88,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"path"
 	"regexp"
 	"sort"
@@ -575,8 +579,15 @@ func after() {
 	}
 	if err := ioutil.WriteFile(*outputFile, finaldst.Bytes(), 777); err != nil {
 		log.Fatal(err)
-		os.Exit(1)
 	}
+	cmd := exec.Command("goreturns", "-w", *outputFile)
+	if cmd == nil {
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	cmd.Wait()
 }
 
 type definf struct {
