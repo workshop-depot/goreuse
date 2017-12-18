@@ -520,6 +520,16 @@ func after() {
 	if info, err := os.Stat(*outputFile); err != nil || info.IsDir() {
 		return
 	}
+	defer func() {
+		cmd := exec.Command("goreturns", "-w", *outputFile)
+		if cmd == nil {
+			return
+		}
+		if err := cmd.Start(); err != nil {
+			return
+		}
+		cmd.Wait()
+	}()
 	fset := token.NewFileSet()
 	fast, err := parser.ParseFile(
 		fset,
@@ -580,14 +590,6 @@ func after() {
 	if err := ioutil.WriteFile(*outputFile, finaldst.Bytes(), 777); err != nil {
 		log.Fatal(err)
 	}
-	cmd := exec.Command("goreturns", "-w", *outputFile)
-	if cmd == nil {
-		return
-	}
-	if err := cmd.Start(); err != nil {
-		return
-	}
-	cmd.Wait()
 }
 
 type definf struct {
